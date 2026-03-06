@@ -1,0 +1,9 @@
+public:
+    const std::string id;
+    // TODO: fix error
+    StudentWrapper(const std::string &id, const Student &student)
+        : student(student), id(id)
+    {}
+
+Error：原始代码在构造函数内部对常量成员变量进行了赋值.
+Fix：常量数据成员应当在初始化列表中进行初始化。
