@@ -9,7 +9,8 @@ SEP/
 ├─ README.md
 ├─ Lab/
 │  ├─ lab1/  # Lab1: student/course score manager.
-|  └─ lab2/  # Lab2: Y86-64 Simulator.         
+|  ├─ lab2/  # Lab2: Y86-64 Simulator.    
+|  └─ lab3/  # Lab3: Hanoi Tower Game.     
 └─ Lab Init/ # The Original Starting Files and Instructions for each Lab.
 ```
 
