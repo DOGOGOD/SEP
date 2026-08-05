@@ -1,0 +1,314 @@
+// @vitest-environment jsdom
+
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ThreadViewport } from "./ThreadViewport";
+
+beforeEach(() => window.localStorage.clear());
+afterEach(cleanup);
+
+describe("ThreadViewport user messages", () => {
+  it("centers user text and supports preset or local avatars from the context menu", async () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{ role: "user", content: "你好呀" }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const bubble = view.getByText("你好呀").closest(".flex.min-h-10");
+    expect(bubble?.className).toContain("items-center");
+    expect(view.getByText("你好呀").parentElement?.className).toContain("user-message-content");
+
+    const avatar = view.getByRole("button", { name: /用户头像/ });
+    fireEvent.contextMenu(avatar);
+    const menu = view.getByRole("menu", { name: "选择用户头像" });
+    expect(menu.className).toContain("fixed");
+    expect(menu.parentElement).toBe(document.body);
+    expect(view.getByRole("button", { name: "导入本地图片" })).toBeTruthy();
+
+    fireEvent.change(view.getByLabelText("导入本地头像图片"), {
+      target: { files: [new File(["not an image"], "avatar.svg", { type: "image/svg+xml" })] },
+    });
+    await waitFor(() => {
+      expect(view.getByRole("alert").textContent).toContain("请选择 PNG");
+    });
+
+    fireEvent.click(view.getByTitle("猫咪"));
+    expect(window.localStorage.getItem("sjtuclaw.user-avatar")).toBe("cat");
+    expect(view.getByRole("button", { name: /猫咪/ })).toBeTruthy();
+  });
+
+  it("renders network and workspace-local images inside messages", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[
+          { role: "assistant", content: "![network](https://example.com/a.png)" },
+          { role: "assistant", content: "![local](C:\\workspace\\result.png)" },
+        ]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    expect(view.getByRole("img", { name: "network" }).getAttribute("src"))
+      .toBe("https://example.com/a.png");
+    expect(view.getByRole("img", { name: "local" }).getAttribute("src"))
+      .toBe("/sessions/session-a/local-image?path=C%3A%5Cworkspace%5Cresult.png");
+  });
+
+  it("renders attachment filenames containing brackets as images", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "user",
+          content: "描述一下\n\n![IMG_30\\[1\\].PNG](/sessions/session-a/attachments/att_demo)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const image = view.container.querySelector("img");
+    expect(image?.getAttribute("alt")).toBe("IMG_30[1].PNG");
+    expect(image?.getAttribute("src")).toBe("/sessions/session-a/attachments/att_demo");
+  });
+
+  it("renders Pi bash results with Chinese text and Windows paths intact", () => {
+    const output =
+      "当前目录：C:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw\nREADME.md 已找到";
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "tool",
+          name: "bash",
+          tool_call_id: "call-pi-bash",
+          content: output,
+        }]}
+        loading={false}
+        sessionId="session-pi"
+      />
+    );
+
+    fireEvent.click(view.getByText("bash").closest("button")!);
+    fireEvent.click(view.getByText("执行结果"));
+
+    expect(view.container.querySelector("pre")?.textContent).toBe(output);
+    expect(view.container.textContent).not.toContain("\ufffd");
+  });
+
+  it("renders image downloads as a preview plus a separate download control", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "图片已生成：[点击下载 heart.png](/downloads/dl_demo)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    expect(view.getByRole("img", { name: "heart.png" }).getAttribute("src"))
+      .toBe("/downloads/dl_demo");
+    expect(view.getByRole("img", { name: "heart.png" }).closest("a")).toBeNull();
+    const download = view.getByRole("link", { name: "下载 heart.png" });
+    expect(download.getAttribute("href")).toBe("/downloads/dl_demo?download=1");
+    expect(download.getAttribute("download")).toBe("heart.png");
+  });
+
+  it("makes generated image markdown downloadable from its inline preview", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "点击下载它：\n\n![heart.png](/downloads/dl_generated)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const image = view.getByRole("img", { name: "heart.png" });
+    expect(image.closest("a")).toBeNull();
+    const download = view.getByRole("link", { name: "下载 heart.png" });
+    expect(download.getAttribute("href")).toBe("/downloads/dl_generated?download=1");
+    expect(download.getAttribute("download")).toBe("heart.png");
+  });
+
+  it("keeps a failed image inside the chat instead of opening an error page", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "![heart.png](/downloads/dl_missing)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    fireEvent.error(view.getByRole("img", { name: "heart.png" }));
+
+    expect(view.getByRole("status").textContent).toContain("图片暂时无法显示");
+    expect(view.queryByRole("link", { name: /无法显示/ })).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "重试" }));
+    expect(view.getByRole("img", { name: "heart.png" })).toBeTruthy();
+  });
+
+  it("deduplicates image and link markdown for the same download", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: [
+            "![heart.png](/downloads/dl_same)",
+            "[下载 heart.png](/downloads/dl_same)",
+            "![heart.png](/downloads/dl_same)",
+          ].join("\n\n"),
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    expect(view.getAllByRole("img", { name: "heart.png" })).toHaveLength(1);
+    expect(view.getAllByRole("link", { name: "下载 heart.png" })).toHaveLength(1);
+  });
+
+  it("renders regular download links as file download controls", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "文件已准备好：\n\n[下载 数据库索引性能实验报告.md](/downloads/dl_report)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const link = view.getByRole("link", { name: /下载 数据库索引性能实验报告\.md/ });
+    expect(link.getAttribute("href")).toBe("/downloads/dl_report");
+    expect(link.hasAttribute("download")).toBe(true);
+  });
+
+  it("renders uploaded non-image attachments as download controls", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "user",
+          content: "[附件 notes.txt](/sessions/session-a/attachments/att_notes)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const link = view.getByRole("link", { name: /附件 notes\.txt/ });
+    expect(link.getAttribute("href")).toBe("/sessions/session-a/attachments/att_notes");
+    expect(link.hasAttribute("download")).toBe(true);
+  });
+
+  it("renders adjacent display math formulas with KaTeX", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "$$x = 16\\sin^3t$$$$y = 13\\cos t - 5\\cos 2t -2\\cos 3t -\\cos 4t$$",
+        }]}
+        loading={false}
+        sessionId="session-math"
+      />
+    );
+
+    expect(view.container.querySelectorAll(".katex-display")).toHaveLength(2);
+    expect(view.container.textContent).toContain("x=16");
+    expect(view.container.textContent).toContain("y=13");
+  });
+
+  it("renders native LaTeX inline and display delimiters", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "设 \\(D\\) 是有界区域，且 \\(P(x,y)\\) 连续：\n\n\\[\n\\oint_{\\partial D} P\\,dx + Q\\,dy = \\iint_D \\left(\\frac{\\partial Q}{\\partial x} - \\frac{\\partial P}{\\partial y}\\right) dx\\,dy\n\\]",
+        }]}
+        loading={false}
+        sessionId="session-native-latex"
+      />
+    );
+
+    expect(view.container.querySelectorAll(".katex").length).toBeGreaterThanOrEqual(3);
+    expect(
+      view.container.querySelectorAll(".katex-display"),
+      view.container.innerHTML
+    ).toHaveLength(1);
+
+    const visibleMath = Array.from(
+      view.container.querySelectorAll<HTMLElement>(".katex-html")
+    ).map((node) => node.textContent || "").join("");
+    expect(visibleMath).not.toContain("\\oint");
+    expect(visibleMath).not.toContain("\\partial");
+
+    const annotations = Array.from(
+      view.container.querySelectorAll("annotation[encoding='application/x-tex']")
+    ).map((node) => node.textContent || "");
+    expect(annotations.some((value) => value.includes("\\oint"))).toBe(true);
+  });
+
+  it("shows rollback only for checkpointed user messages when workspace rollback is enabled", () => {
+    const onRollback = vi.fn().mockResolvedValue(undefined);
+    const view = render(
+      <ThreadViewport
+        messages={[
+          { role: "user", content: "old", messageId: "old" },
+          {
+            role: "user",
+            content: "revertible",
+            messageId: "m1",
+            rollbackCheckpointId: "cp_1",
+            rollbackAvailable: true,
+          },
+          { role: "assistant", content: "answer", rollbackCheckpointId: "cp_1", rollbackAvailable: true },
+        ]}
+        loading={false}
+        sessionId="session-rollback"
+        rollbackEnabled
+        onRollback={onRollback}
+      />
+    );
+
+    const buttons = view.getAllByRole("button", { name: "回退到此消息发送前" });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onRollback).toHaveBeenCalledWith("cp_1");
+  });
+
+  it("hides or disables rollback when unavailable or already rolling back", () => {
+    const message = {
+      role: "user" as const,
+      content: "checkpointed",
+      rollbackCheckpointId: "cp_1",
+      rollbackAvailable: true,
+    };
+    const hidden = render(
+      <ThreadViewport messages={[message]} loading={false} sessionId="s" />
+    );
+    expect(hidden.queryByRole("button", { name: "回退到此消息发送前" })).toBeNull();
+    hidden.unmount();
+
+    const disabled = render(
+      <ThreadViewport
+        messages={[message]}
+        loading={false}
+        sessionId="s"
+        rollbackEnabled
+        rollingBack
+      />
+    );
+    expect(disabled.getByRole("button", { name: "回退到此消息发送前" }))
+      .toHaveProperty("disabled", true);
+  });
+});

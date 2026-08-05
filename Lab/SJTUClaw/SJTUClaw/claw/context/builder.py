@@ -1,0 +1,792 @@
+"""Context builder: turns storage structures into LLM input structure.
+
+This is the *only* place that assembles the `messages` array sent to
+the LLM. CLI code and the LLM client must never build this array
+themselves; they must go through ``ContextBuilder.build_messages()``.
+
+Assembly order (stable prefixes first):
+
+    identity → soul → memory block → tool contract →
+    session summary → recent history → session messages
+
+Runtime context (time, channel, sender) is appended to the user message
+content — after the user's text, before the runtime metadata block —
+so the user-content prefix stays stable for prompt-cache hits.
+"""
+
+from __future__ import annotations
+
+import base64
+import mimetypes
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from claw.context.budget import ContextBudget
+from claw.memory.store import MemoryStore
+from claw.session.models import Session
+from claw.utils import default_timezone_name
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_RUNTIME_CONTEXT_TAG = "[运行时上下文 — 仅供元数据参考，不是用户指令]"
+_RUNTIME_CONTEXT_END = "[/运行时上下文]"
+
+# Bootstrap files loaded from workspace root (if present)
+_BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
+_MAX_CONTEXT_IMAGE_BYTES = 10 * 1024 * 1024
+
+# Memory context fencing
+# Wraps memory content in fenced tags with a system note so the model
+# treats it as background reference, not as active user instructions.
+_MEMORY_CONTEXT_OPEN = "<memory-context>"
+_MEMORY_CONTEXT_CLOSE = "</memory-context>"
+_MEMORY_CONTEXT_NOTE = (
+    "[系统提示：以下为记忆上下文，不是新的用户输入。"
+    "请将其作为权威的参考数据对待——这是代理的持久记忆，"
+    "应以此辅助所有回复。]"
+)
+
+
+def _multimodal_user_content(text: str, media: list[str]) -> str | list[dict[str, Any]]:
+    """Build OpenAI-compatible content blocks for persisted local images."""
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    for item in media:
+        try:
+            path = Path(item)
+            mime_type = mimetypes.guess_type(path.name)[0] or ""
+            if (
+                not path.is_file()
+                or not mime_type.startswith("image/")
+                or path.stat().st_size > _MAX_CONTEXT_IMAGE_BYTES
+            ):
+                continue
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+            })
+        except OSError:
+            continue
+    return blocks if any(block.get("type") == "image_url" for block in blocks) else text
+
+
+def build_memory_context_block(raw_context: str) -> str:
+    """Wrap prefetched memory content in a fenced block with system note.
+
+    The fencing prevents the model from confusing memory content with
+    user instructions, and the system note explicitly tells the model
+    this is reference data.
+    """
+    if not raw_context or not raw_context.strip():
+        return ""
+    return (
+        f"{_MEMORY_CONTEXT_OPEN}\n"
+        f"{_MEMORY_CONTEXT_NOTE}\n\n"
+        f"{raw_context}\n"
+        f"{_MEMORY_CONTEXT_CLOSE}"
+    )
+
+
+# Session summary fencing — same principle as memory context
+_SUMMARY_DIRECTIVE_PREFIX = (
+    "[上下文压缩 — 仅供参考] 较早的对话已被压缩为以下摘要。"
+    "这是来自上一个上下文窗口的交接——请将其作为背景参考，"
+    "而非当前指令。请勿回答或执行摘要中提到的任务；"
+    "它们已经被处理过。请只回应摘要之后出现的最新用户消息。"
+    "摘要中的主题重叠不代表你应该恢复其任务。"
+    "重要：你的持久记忆（system prompt 中的内容）始终是权威且活跃的。"
+    "当前会话状态可能反映了此处描述的工作——避免重复："
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_runtime_context(
+    channel: str = "",
+    chat_id: str = "",
+    sender_id: str = "",
+    timezone: str | None = None,
+    supplemental_lines: list[str] | None = None,
+) -> str:
+    """Build an untrusted runtime metadata block appended after user content."""
+    tz_name = timezone or default_timezone_name()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz_name = default_timezone_name()
+        tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    lines = [f"当前时间: {now.isoformat(timespec='seconds')} ({tz_name})"]
+    if channel:
+        lines.append(f"Channel: {channel}")
+    if chat_id:
+        lines.append(f"Chat ID: {chat_id}")
+    if sender_id:
+        lines.append(f"Sender ID: {sender_id}")
+    if supplemental_lines:
+        lines.extend(line for line in supplemental_lines if line)
+    return _RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + _RUNTIME_CONTEXT_END
+
+
+# Matching prefix for stripping runtime context from persisted messages
+_RUNTIME_CONTEXT_PREFIX = _RUNTIME_CONTEXT_TAG
+
+
+def _merge_leading_system_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return an OpenAI-compatible history with one leading system message.
+
+    Some compatible gateways (including the Qwen route used by SJTU) reject
+    multiple consecutive ``system`` messages even when every one is at the
+    beginning of the history.  ContextBuilder composes several independent
+    system sections, so consolidate that leading run at the provider boundary
+    while leaving all conversation, multimodal, and tool messages untouched.
+    """
+    system_count = 0
+    system_sections: list[str] = []
+    for message in messages:
+        if message.get("role") != "system":
+            break
+        system_count += 1
+        content = message.get("content", "")
+        if isinstance(content, str) and content.strip():
+            system_sections.append(content.strip())
+
+    if system_count <= 1:
+        return messages
+
+    merged = dict(messages[0])
+    merged["content"] = "\n\n---\n\n".join(system_sections)
+    return [merged, *messages[system_count:]]
+
+
+class ContextBuilder:
+    """Assembles system prompt, soul, memory, tool info,
+    session summary, recent history and session messages."""
+
+    # -- Tool contract (loaded from template) ----------------------------
+
+    @property
+    def tool_contract(self) -> str:
+        if self._tool_contract is None:
+            try:
+                from claw.prompts import load_tool_contract
+                self._tool_contract = load_tool_contract()
+            except Exception:
+                self._tool_contract = (
+                    "## 工具使用规则\n\n"
+                    "你可以使用工具来完成任务。调用工具时：\n"
+                    "- 在同一轮中可以调用多个工具。\n"
+                    "- 工具结果是只读的，不会自动保存到对话中。\n"
+                    "- 如果工具调用失败，分析错误原因并尝试不同的方法。\n"
+                    "- 长期记忆的读写通过 `remember` 和 `recall` 工具完成。"
+                )
+        return self._tool_contract
+
+    def __init__(
+        self,
+        system_prompt: str,
+        soul: str,
+        memory_store: MemoryStore,
+        workspace_path: str = "",
+        timezone: str | None = None,
+        channel: str = "",
+        workspace_manager=None,
+        sandbox_manager=None,
+    ):
+        self._system_prompt = system_prompt
+        self._soul = soul
+        self._memory_store = memory_store
+        self._workspace_path = workspace_path
+        self._timezone = timezone
+        self._channel = channel
+        self._workspace_manager = workspace_manager
+        self._sandbox_manager = sandbox_manager
+        self._skill_registry = None
+        self._skill_block_cache: str | None = None
+        self._skill_block_version: int = -1
+
+        # Lazy-loaded template content
+        self._tool_contract: str | None = None
+        self._identity: str | None = None
+
+        # Cache for the stable system-message prefix.
+        # Invalidated when system_prompt / soul are hot-reloaded.
+        self._system_prefix_cache: list[dict[str, str]] | None = None
+        self._prefix_version: int = 0
+
+        # Dynamic workspace cache — per-session workspace roots.
+        self._ws_cache: dict[str, str] = {}
+        self._ws_version: int = 0
+
+        # Cache for memory block — avoids recomputing on every
+        # build_messages call within the same turn.
+        self._memory_block_cache: str | None = None
+        self._memory_block_version: int = -1
+
+    # -- public API ----------------------------------------------------------
+
+    def set_skill_registry(self, registry) -> None:
+        """Attach the registry used for progressive Skill discovery/loading."""
+        self._skill_registry = registry
+        self._skill_block_cache = None
+        self._skill_block_version = -1
+
+    def build_messages(
+        self,
+        session: Session,
+        tool_registry=None,
+        include_tool_instructions: bool = True,
+        return_budget: bool = False,
+        max_context_tokens: int | None = None,
+        channel: str = "",
+        chat_id: str = "",
+        sender_id: str = "",
+        session_summary: str | None = None,
+        supplemental_runtime_lines: list[str] | None = None,
+    ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], ContextBudget]:
+        """Build the full ``messages`` array to send to the LLM for *session*.
+
+        Args:
+            session: the current session whose history to include.
+            tool_registry: optional ``ToolRegistry``. When provided, its
+                ``list_compact_definitions()`` are embedded in a system
+                message (only relevant for the JSON-protocol fallback).
+            include_tool_instructions: when False, tool definitions and
+                protocol instructions are omitted from the context.
+            return_budget: when True, also return a ``ContextBudget``.
+            max_context_tokens: token budget ceiling.
+            channel: the channel name (e.g. "cli", "discord").
+            chat_id: the chat/channel identifier.
+            sender_id: the sender identifier.
+            session_summary: override summary (from idle-session archival).
+            supplemental_runtime_lines: extra lines for the runtime context.
+
+        Returns:
+            When *return_budget* is False: the ``messages`` list.
+            When *return_budget* is True: ``(messages, budget)`` tuple.
+        """
+        # --- Stable prefix (prompt-cache friendly, cached across iterations) ---
+        effective_ws = self._resolve_workspace(session.session_id)
+        messages = list(self._get_system_prefix(workspace_path=effective_ws))
+        sandbox_context = self._build_sandbox_context(session.session_id)
+        if sandbox_context is not None:
+            messages.append({"role": "system", "content": sandbox_context})
+
+        # Memory block
+        memory_block = self._build_memory_block()
+        if memory_block is not None:
+            messages.append({"role": "system", "content": memory_block})
+
+        # Tool definitions (JSON fallback path only — skip for native function
+        # calling since tools travel via the API ``tools`` parameter).
+        tool_defs_text = ""
+        if include_tool_instructions and tool_registry is not None:
+            pass
+
+        skill_block = self._build_skill_block()
+        if skill_block is not None:
+            messages.append({"role": "system", "content": skill_block})
+
+        # --- Volatile suffix (changes every turn) ---
+        # Session summary / archived context
+        effective_summary = session_summary or session.summary.strip()
+        summary_block = self._build_summary_block(effective_summary)
+        if summary_block is not None:
+            messages.append({"role": "system", "content": summary_block})
+
+        # --- Conversation messages ---
+        runtime_ctx = _build_runtime_context(
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            timezone=self._timezone,
+            supplemental_lines=supplemental_runtime_lines,
+        )
+
+        unconsolidated = session.get_unconsolidated_messages()
+        latest_user_index = next(
+            (
+                index
+                for index in range(len(unconsolidated) - 1, -1, -1)
+                if unconsolidated[index].role == "user"
+            ),
+            -1,
+        )
+        for i, msg in enumerate(unconsolidated):
+            msg_dict = msg.to_dict()
+            msg_dict.pop("media", None)
+            # Legacy sessions may contain orphan tool messages without the
+            # matching assistant tool_calls entry. Strict providers reject
+            # those messages, so preserve them as ordinary assistant context.
+            if msg.role == "tool" and not msg.tool_call_id:
+                msg_dict = {
+                    "role": "assistant",
+                    "content": f"[历史工具结果]\n{msg.content}",
+                }
+            message_content = str(msg_dict.get("content", msg.content))
+            if (
+                msg.role == "user"
+                and i == len(unconsolidated) - 1
+                and runtime_ctx
+            ):
+                message_content = f"{message_content}\n\n{runtime_ctx}"
+            if msg.role == "user" and msg.media and i == latest_user_index:
+                msg_dict["content"] = _multimodal_user_content(message_content, msg.media)
+            else:
+                msg_dict["content"] = message_content
+            messages.append(msg_dict)
+
+        # Keep the provider-facing history portable.  In particular, the
+        # SJTU Qwen/LiteLLM route requires exactly one system message at index
+        # zero instead of several consecutive system sections.
+        messages = _merge_leading_system_messages(messages)
+
+        if return_budget:
+            budget = ContextBudget.measure(
+                max_tokens=max_context_tokens or 25600,
+                system_prompt=self._system_prompt,
+                soul=self._soul,
+                memory_block=memory_block,
+                tool_defs_text=tool_defs_text,
+                skill_block=skill_block,
+                summary_block=summary_block,
+                messages=unconsolidated,
+            )
+            return messages, budget
+
+        return messages
+
+    def get_tool_definitions(self, tool_registry=None) -> list[dict[str, Any]]:
+        """Return OpenAI-format tool definitions for the API ``tools`` param."""
+        if tool_registry is None:
+            return []
+        return tool_registry.list_definitions()
+
+    def update_system_prompt(self, content: str) -> None:
+        """Hot-reload the system prompt without restarting the server."""
+        self._system_prompt = content
+        self._invalidate_cache()
+
+    def update_soul(self, content: str) -> None:
+        """Hot-reload the soul without restarting the server."""
+        self._soul = content
+        self._invalidate_cache()
+
+    def build_skill_injection_message(self, skill_name: str, user_task: str) -> str:
+        """Load a selected Skill and combine it with the concrete user task."""
+        if self._skill_registry is None:
+            return user_task
+        try:
+            available, reason = self._skill_registry.get_skill_availability(skill_name)
+            if not available:
+                return f"[Skill 加载失败: {reason}]\n\n{user_task}"
+            full = self._skill_registry.format_full_content(skill_name)
+            self._skill_registry.record_use(skill_name)
+        except Exception as exc:
+            return f"[Skill 加载失败: {exc}]\n\n{user_task}"
+        return (
+            f"[系统提示] 已加载 Skill \"{skill_name}\"，请严格按以下说明执行。\n\n"
+            f"{full}\n\n"
+            f"--- 用户任务 ---\n{user_task}"
+        )
+
+    # -- internal ------------------------------------------------------------
+
+    def _resolve_workspace(self, session_id: str | None = None) -> str:
+        """Return the effective workspace path for *session_id*."""
+        if self._workspace_manager is not None and session_id:
+            ws = self._workspace_manager.get(session_id)
+            if ws is not None:
+                return str(ws)
+        return self._workspace_path or ""
+
+    def _build_sandbox_context(self, session_id: str) -> str | None:
+        """Describe native-tool isolation without treating guest paths as host paths."""
+        manager = self._sandbox_manager
+        workspace_manager = self._workspace_manager
+        if manager is None or workspace_manager is None:
+            return None
+        if not manager.is_session_enabled(session_id):
+            return None
+        status = manager.status(session_id, workspace_manager)
+        if not status["covered"]:
+            return None
+        if not status["available"]:
+            if status["mode"] == "required":
+                return (
+                    "## Sandbox 运行环境\n\n"
+                    "当前配置要求所有原生文件和 Shell 工具使用 microsandbox，"
+                    "但运行时不可用。工具会 fail-closed，绝不会回退到宿主执行。"
+                )
+            return None
+        kind = (
+            "用户明确绑定的宿主 workspace（仅该目录挂载进 microVM）"
+            if status["workspaceKind"] == "host-mounted"
+            else "当前 session 的持久化 sandbox 私有 workspace"
+        )
+        python_context = ""
+        if status.get("projectVenv"):
+            python_context = (
+                f"项目依赖持久化在 `{status['projectVenv']}`；Shell 中的 "
+                "`python` 与 `pip` 已指向 microVM 内的运行 venv，并通过 "
+                "`--system-site-packages` 复用基础镜像通用库。每条 Shell "
+                "命令结束后，项目包和 console scripts 会自动同步回持久目录，"
+                "下次 microVM 启动时恢复。直接使用 `pip install` 或 "
+                "`python -m pip install` 即可；不要尝试 source "
+                "`/workspace/.venv/bin/activate`。项目依赖仍应写入 "
+                "requirements.txt 或项目自己的依赖清单。"
+            )
+        return (
+            "## Sandbox 运行环境\n\n"
+            "SJTUClaw 原生文件工具与 Shell 在同一个 microsandbox microVM 中运行。"
+            f"可操作工作区是 {kind}，guest 路径为 `{status['guestWorkspace']}`。"
+            "没有宿主 workspace 时无需请求用户先设置，直接使用相对路径或 "
+            "`/workspace` 即可。不要把 Windows 盘符路径传给工具；"
+            "需要宿主文件时请使用附件导入或请用户显式绑定 workspace。"
+            "Shell 是 Linux `/bin/sh`，可以安全使用 microVM 内的 `/tmp` 等路径；"
+            "结构化文件工具仍限定在 `/workspace`。"
+            f"{python_context}"
+        )
+
+    def bound_workspace(self, session_id: str) -> str | None:
+        """Return the explicitly bound workspace for an agent session.
+
+        Full-turn backends such as Pi and Claude Code use this as their process
+        cwd.  It is only a starting directory for external backends, not an
+        SJTUClaw-enforced file-operation boundary.  The generic context fallback
+        is intentionally excluded because it is not an explicit binding.
+        """
+        if self._workspace_manager is None:
+            return None
+        workspace = self._workspace_manager.get(session_id)
+        return str(workspace) if workspace is not None else None
+
+    def build_pi_append_prompt(self, session_id: str) -> str:
+        """Build SJTUClaw context that can safely extend Pi's native prompt.
+
+        Pi remains responsible for describing its active tools and their
+        calling guidelines.  In particular, the legacy SJTUClaw tool contract
+        is deliberately not copied here because its file-tool names differ
+        from Pi's native ``read``/``bash``/``edit``/``write`` tools.
+        """
+        import platform
+
+        workspace = self._resolve_workspace(session_id)
+        runtime = (
+            f"{'macOS' if platform.system() == 'Darwin' else platform.system()} "
+            f"{platform.machine()}, Python {platform.python_version()}"
+        )
+        identity_lines = [
+            "## SJTUClaw 运行环境",
+            runtime,
+            "",
+            "## 工作区",
+            f"当前工作区：`{workspace or '.'}`",
+            "",
+            "默认使用中文回复，除非用户明确要求其他语言。",
+        ]
+        if self._timezone:
+            identity_lines.append(f"当前时区：`{self._timezone}`")
+        sections = [
+            "\n".join(identity_lines),
+            self._system_prompt,
+            self._soul,
+        ]
+        bootstrap = self._build_bootstrap_block(workspace_path=workspace)
+        if bootstrap:
+            sections.append(bootstrap)
+        memory = self._build_memory_block()
+        if memory:
+            sections.append(memory)
+        sections.append(
+            "## Pi 与 SJTUClaw 集成规则\n\n"
+            "Pi 原生工具只有四个：`read`（读取文件）、`bash`（执行命令）、"
+            "`edit`（编辑文件）、`write`（创建/覆盖文件）。这四个工具的定义和调用规则 "
+            "以 Pi 原生 system prompt 为准。绑定的工作区只作为 Pi 的启动目录，"
+            "不构成 SJTUClaw 文件访问边界；Pi 原生文件和命令工具不受 SJTUClaw "
+            "workspace 越界限制，其访问范围由 Pi 自身规则和运行环境决定。\n\n"
+            "SJTUClaw 通过宿主工具桥接补充了以下能力：长期记忆（`recall`/`remember`）、"
+            "定时任务（`cron`）、时间查询（`current_time`）、Web 访问（`web_search`/`web_fetch`）、"
+            "附件管理（`copy_attachment_to_workspace`）和文件下载（`create_download`）。\n\n"
+            "所有工具的结果均来自实际执行，不得伪造。会改变状态的宿主桥接工具仍受 "
+            "SJTUClaw 审批，并遵守各自工具契约；这不会限制 Pi 的原生文件和命令工具。"
+            + (
+                "\n\n当前宿主是 Windows。Pi 的 bash 已经在当前工作区启动；执行工作区内"
+                "命令时优先使用 `.` 和相对路径，不要把带反斜杠的 Windows 绝对路径"
+                "原样传给 bash。确需绝对路径时，先执行 `pwd` 获取当前 shell 使用的"
+                "路径格式，再使用该格式并加引号。"
+                if platform.system() == "Windows"
+                else ""
+            )
+        )
+        return "\n\n---\n\n".join(section for section in sections if section.strip())
+
+    def build_claude_code_append_prompt(self, session_id: str) -> str:
+        """Build host context without replacing Claude Code's native prompt."""
+        import platform
+
+        workspace = self._resolve_workspace(session_id)
+        runtime = (
+            f"{'macOS' if platform.system() == 'Darwin' else platform.system()} "
+            f"{platform.machine()}, Python {platform.python_version()}"
+        )
+        identity_lines = [
+            "## SJTUClaw 运行环境",
+            runtime,
+            "",
+            "## 工作区",
+            f"当前工作区：`{workspace or '.'}`",
+            "",
+            "默认使用中文回复，除非用户明确要求其他语言。",
+        ]
+        if self._timezone:
+            identity_lines.append(f"当前时区：`{self._timezone}`")
+        sections = [
+            "\n".join(identity_lines),
+            self._system_prompt,
+            self._soul,
+        ]
+        bootstrap = self._build_bootstrap_block(workspace_path=workspace)
+        if bootstrap:
+            sections.append(bootstrap)
+        memory = self._build_memory_block()
+        if memory:
+            sections.append(memory)
+        sections.append(
+            "## Claude Code 与 SJTUClaw 集成规则\n\n"
+            "你正在作为 SJTUClaw 当前会话的 Claude Code 后端运行。"
+            "文件读取、搜索、编辑、命令执行、Skills、MCP 和子 Agent 等能力，"
+            "以 Claude Code 的原生 system prompt、用户配置和权限策略为准。\n\n"
+            "SJTUClaw 负责展示对话和工具进度、保存统一会话记录，并将显式绑定的"
+            "工作区作为启动目录；该目录不构成 SJTUClaw 文件访问边界。SJTUClaw "
+            "不对 Claude Code 原生工具施加 workspace 越界限制。\n\n"
+            "SJTUClaw 通过 MCP 宿主工具桥接补充长期记忆（`recall`/`remember`）、"
+            "定时任务（`cron`）、时间查询（`current_time`）、Web 访问"
+            "（`web_search`/`web_fetch`）、附件管理和下载等能力。搜索、读取、查询"
+            "等只读操作无需 SJTUClaw 审批；写入、删除或其他会改变状态的操作必须"
+            "经过审批。所有工具结果必须来自实际执行，不得伪造。"
+        )
+        return "\n\n---\n\n".join(
+            section for section in sections if section.strip()
+        )
+
+    def _invalidate_cache(self) -> None:
+        self._system_prefix_cache = None
+        self._prefix_version += 1
+        self._memory_block_cache = None
+        self._memory_block_version = -1
+        self._ws_cache.clear()
+        self._ws_version += 1
+        if hasattr(self, "_ws_prefix_cache"):
+            self._ws_prefix_cache.clear()
+        if hasattr(self, "_static_prefix_suffix"):
+            del self._static_prefix_suffix
+
+    def _get_system_prefix(
+        self, workspace_path: str | None = None
+    ) -> list[dict[str, str]]:
+        """Return the cached stable system-message prefix."""
+        ws = workspace_path or self._workspace_path or ""
+
+        if not hasattr(self, "_ws_prefix_cache"):
+            self._ws_prefix_cache: dict[str, list[dict[str, str]]] = {}
+        if ws in self._ws_prefix_cache:
+            return self._ws_prefix_cache[ws]
+
+        prefix: list[dict[str, str]] = []
+
+        identity = self._build_identity_block(workspace_path=ws)
+        prefix.append({"role": "system", "content": identity})
+
+        if not hasattr(self, "_static_prefix_suffix"):
+            suffix: list[dict[str, str]] = []
+            suffix.append({"role": "system", "content": self._system_prompt})
+            suffix.append({"role": "system", "content": self._soul})
+            suffix.append({"role": "system", "content": self.tool_contract})
+            self._static_prefix_suffix = suffix
+
+        prefix.extend(self._static_prefix_suffix)
+
+        bootstrap = self._build_bootstrap_block(workspace_path=ws)
+        if bootstrap:
+            prefix.append({"role": "system", "content": bootstrap})
+
+        self._ws_prefix_cache[ws] = prefix
+        return prefix
+
+    def _build_identity_block(self, workspace_path: str | None = None) -> str:
+        """Build the identity/runtime preamble using the prompt template system."""
+        ws = workspace_path or self._workspace_path or ""
+        try:
+            from claw.prompts import build_identity
+            return build_identity(
+                workspace_path=ws,
+                channel=self._channel or "",
+                timezone=self._timezone,
+            )
+        except Exception:
+            pass
+
+        import platform
+        system = platform.system()
+        runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
+
+        lines = [
+            "你是一个 AI 助手（claw），运行在本地工作区内。",
+            f"工作区路径: {ws}",
+            f"运行环境: {runtime}",
+            "",
+            "始终以中文回复用户，除非用户明确要求其他语言。",
+            "当不确定时，先使用工具获取信息，再回答。不要猜测。",
+        ]
+        return "\n".join(lines)
+
+    def _build_bootstrap_block(
+        self, workspace_path: str | None = None
+    ) -> str | None:
+        """Load bootstrap files (AGENTS.md, etc.) from the workspace."""
+        ws = workspace_path or self._workspace_path or ""
+        if not ws:
+            return None
+        from pathlib import Path
+        root = Path(ws)
+        parts: list[str] = []
+        for filename in _BOOTSTRAP_FILES:
+            file_path = root / filename
+            if file_path.exists():
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                    parts.append(f"## {filename}\n\n{content}")
+                except OSError:
+                    pass
+        return "\n\n".join(parts) if parts else None
+
+    def _build_memory_block(self) -> str | None:
+        """Build a lightweight memory index block."""
+        current_version = self._memory_store.version
+        if (
+            self._memory_block_cache is not None
+            and self._memory_block_version == current_version
+        ):
+            return self._memory_block_cache
+
+        entries = self._memory_store.list()
+        if not entries:
+            self._memory_block_cache = None
+            self._memory_block_version = current_version
+            return None
+
+        _LABELS: dict[str, str] = {
+            "user_preference": "用户偏好",
+            "project": "项目信息",
+            "decision": "决策记录",
+            "fact": "一般事实",
+            "general": "其他",
+        }
+        category_counts: dict[str, int] = {}
+        for e in entries:
+            cat = e.category
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+
+        parts = [
+            f"{_LABELS.get(cat, cat)} {count} 条"
+            for cat, count in sorted(category_counts.items())
+        ]
+
+        recent_preview = ""
+        sorted_by_time = sorted(
+            entries, key=lambda e: e.updated_at, reverse=True
+        )[:5]
+        if sorted_by_time:
+            preview_lines = "\n".join(
+                f"- [{e.category}] {e.content[:120]}{'...' if len(e.content) > 120 else ''}"
+                for e in sorted_by_time
+            )
+            recent_preview = f"\n\n最近更新的记忆：\n{preview_lines}"
+
+        block = (
+            "## 长期记忆 (Memory)\n\n"
+            f"当前存储了 {len(entries)} 条长期记忆：{', '.join(parts)}。"
+            f"{recent_preview}\n\n"
+            "**重要规则**：\n"
+            "- 当用户询问关于他自己的任何问题（身份、背景、项目、偏好、"
+            "之前的决定等）时，你**必须**先调用 `recall` 工具检索相关记忆，"
+            "再基于检索结果回答。不要仅凭当前对话猜测。\n"
+            "- 当你在对话中发现了值得长期保留的新信息时，"
+            "请使用 `remember` 工具主动保存。\n"
+            "- 不要编造或猜测记忆中没有的信息——如果在 recall 中找不到，"
+            "诚实地告诉用户你不知道，并建议用户告诉你。"
+        )
+
+        self._memory_block_cache = block
+        self._memory_block_version = current_version
+        return block
+
+    def _build_skill_block(self) -> str | None:
+        """Build and cache the lightweight Skill index for model routing."""
+        registry = self._skill_registry
+        if registry is None:
+            return None
+        version = getattr(registry, "version", -1)
+        if self._skill_block_version == version:
+            return self._skill_block_cache
+
+        summary = registry.build_skills_summary()
+        if not summary:
+            block = None
+        else:
+            lines = [
+                "## 可用 Skills",
+                "",
+                "以下 Skill 提供可复用工作流。先调用 `skill_view` 按需加载完整说明。",
+                "",
+                summary,
+            ]
+            always_parts: list[str] = []
+            for name in registry.get_always_skills():
+                try:
+                    always_parts.append(registry.format_full_content(name))
+                except Exception:
+                    continue
+            if always_parts:
+                lines.extend(["", "## 自动加载的 Skills", "", *always_parts])
+            lines.extend([
+                "",
+                "任务与某个 Skill 匹配时，调用 `use_skill` 并说明选择理由；"
+                "系统会在用户确认后加载完整说明。",
+            ])
+            block = "\n".join(lines)
+
+        self._skill_block_cache = block
+        self._skill_block_version = version
+        return block
+
+    @staticmethod
+    def _build_summary_block(summary: str) -> str | None:
+        if not summary:
+            return None
+        return (
+            "## 会话历史摘要\n\n"
+            f"{_SUMMARY_DIRECTIVE_PREFIX}\n\n" + summary
+        )
+
+    # -- runtime context helpers (used by session persistence) ----------------
+
+    @staticmethod
+    def runtime_context_tag() -> str:
+        return _RUNTIME_CONTEXT_TAG
+
+    @staticmethod
+    def runtime_context_prefix() -> str:
+        return _RUNTIME_CONTEXT_PREFIX

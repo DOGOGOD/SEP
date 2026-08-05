@@ -1,0 +1,28 @@
+# Reproducible development, desktop, and packaging environment.
+# Core runtime pins stay within the compatible ranges declared in
+# pyproject.toml; optional desktop/build/test tools are pinned below.
+
+# Core runtime
+openai==2.45.0
+python-dotenv==1.1.0
+fastapi==0.121.1
+uvicorn==0.38.0
+python-multipart==0.0.32
+tiktoken==0.13.0
+filelock==3.29.7
+Pillow==12.3.0
+PyYAML==6.0.2
+croniter==6.2.3
+aiohttp==3.11.10
+httpx==0.28.1
+qrcode==8.2
+cryptography==44.0.1
+tzlocal==5.3.1
+textual==8.2.8
+
+# Windows desktop launcher and packaging
+pywebview==6.2.1
+pyinstaller==6.21.0
+
+# Backend test runner
+pytest==9.1.1
